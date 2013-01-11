@@ -40,10 +40,27 @@
  *		along with this program; if not, write to the Free Software
  *		Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
+#ifdef __sun__
+    #define __EXTENSIONS__
+    /* PATH_MAX */
+    #include <limits.h>
+
+    #include <sys/ucontext.h>
+    #include <procfs.h>
+    #include <fcntl.h>
+    #include <sys/types32.h>
+    #include <assert.h>
+
+    #define va_list __va_list
+    #include <procfs.h>
+#endif
+
 #include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
-#include <mntent.h>
+#ifndef __sun__
+    #include <mntent.h>
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,7 +73,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
+#include <umem.h>
 char *Version = "@(#)killall5 2.86 31-Jul-2004 miquels@cistron.nl";
 
 #define STATNAMELEN	15
@@ -181,6 +198,12 @@ static inline void xmemalign(void **memptr, size_t alignment, size_t size)
  */
 int mount_proc(void)
 {
+    #ifdef __sun__
+        const char* checkProc = "/proc/0";
+    #else
+        const char* checkProc = "/proc/version";
+    #endif
+
 	struct stat	st;
 	char		*args[] = { "mount", "-t", "proc", "proc", "/proc", 0 };
 	pid_t		pid, rc;
@@ -188,7 +211,7 @@ int mount_proc(void)
 	int		did_mount = 0;
 
 	/* Stat /proc/version to see if /proc is mounted. */
-	if (stat("/proc/version", &st) < 0 && errno == ENOENT) {
+	if (stat(checkProc, &st) < 0 && errno == ENOENT) {
 
 		/* It's not there, so mount it. */
 		if ((pid = fork()) < 0) {
@@ -215,7 +238,7 @@ int mount_proc(void)
 	}
 
 	/* See if mount succeeded. */
-	if (stat("/proc/version", &st) < 0) {
+	if (stat(checkProc, &st) < 0) {
 		if (errno == ENOENT)
 			nsyslog(LOG_ERR, "/proc not mounted, failed to mount.");
 		else
@@ -237,6 +260,9 @@ static inline int isnetfs(const char * type)
 	return 0;
 }
 
+#ifdef __sun__
+    void init_nfs(void) { }
+#else
 /*
  *     Remember all NFS typed partitions.
  */
@@ -302,6 +328,7 @@ void init_nfs(void)
 	}
 	endmntent(mnt);
 }
+#endif /* not __sun__ */
 
 static void clear_shadow(SHADOW *restrict shadow)
 {
@@ -442,6 +469,365 @@ int readarg(FILE *fp, char *buf, int sz)
 
 	return (c == EOF && f == 0) ? c : f;
 }
+
+
+
+#ifdef __sun__
+
+static int openProcFile(const char* format, int pid)
+{
+    char procfile[100];
+    snprintf(procfile, 100, format, pid);
+    int fd;
+    if ((fd = open(procfile, O_RDONLY)) < 0) {
+        if (errno == EACCES) {
+            // This is normal if you're not root.
+            return -1;
+        }
+        fprintf(stderr, "Error opening [%s]", procfile);
+        perror(" ");
+        exit(1);
+    }
+    return fd;
+}
+
+static int readStringFromAs(int asFd, uint64_t offset, char** strOut, int strOutSize)
+{
+    if (!*strOut) {
+        strOutSize = 16;
+        *strOut = xmalloc(strOutSize);
+    }
+    char* initStr = *strOut;
+    if (pread(asFd, initStr, strOutSize-1, offset) < 0) {
+        initStr[0] = '\0';
+        return 0;
+    }
+    initStr[strOutSize-1] = '\0';
+    int length = strlen(initStr);
+    if (length == strOutSize-1) {
+        // need a bigger buffer.
+        strOutSize *= 2;
+        *strOut = realloc(initStr, strOutSize);
+        assert(*strOut);
+        return readStringFromAs(asFd, offset, strOut, strOutSize);
+    }
+    return length;
+}
+
+static char* getArguments(psinfo_t* psinfo)
+{
+    int asFd = openProcFile("/proc/%d/as", psinfo->pr_pid);
+
+    uintptr_t addrArgs = psinfo->pr_argv;
+    int argCount = psinfo->pr_argc;
+
+    if (argCount == 0) {
+        int* out = xmalloc(4);
+        memcpy(out, &argCount, 4);
+        return (char*) out;
+    }
+
+    // argPointers point to the arguments in the process's memory space.
+    // args point to the copies of them in our memory space.
+    uintptr_t* argPointers = xmalloc(argCount * sizeof(uintptr_t));
+    char** args = xmalloc(argCount * sizeof(uintptr_t));
+
+    if (psinfo->pr_dmodel == PR_MODEL_NATIVE) {
+        pread(asFd, argPointers, argCount * sizeof(uintptr_t), addrArgs);
+    } else {
+        // we are 64-bit, target is 32-bit
+        caddr32_t* argPointers32 = (caddr32_t*) argPointers;
+        pread(asFd, argPointers32, argCount * sizeof(caddr32_t), addrArgs);
+        // convert from 32-bit to 64-bit in place
+        for (int i = argCount - 1; i >= 0; i--) {
+            argPointers[i] = argPointers32[i];
+        }
+    }
+
+    int totalLength = 0;
+    for (int i = 0; i < argCount; i++) {
+        char* arg = NULL;
+        totalLength += readStringFromAs(asFd, argPointers[i], &arg, 0);
+        args[i] = arg;
+    }
+
+    close(asFd);
+
+    // Merge everything into one buffer representing a list of null terminated strings.
+    char* out = malloc(totalLength + argCount + 4);
+    assert(out);
+    memcpy(out, &argCount, 4);
+    int index = 4;
+    for (int i = 0; i < argCount; i++) {
+        int length = strlen(args[i]);
+        memcpy(out + index, args[i], length+1);
+        index += length+1;
+        free(args[i]);
+    }
+    free(argPointers);
+
+    return out;
+}
+
+static char* baseName(char* name)
+{
+    if (!name) { return NULL; }
+    char* base = strrchr(name, '/');
+    return (base) ? base+1 : name;
+}
+
+static void getNfsInodeNumberAndDevice(int do_stat, char* path, struct proc* procOut)
+{
+	procOut->nfs = 0;
+    if (do_stat == DO_NETFS) {
+        char buff[PATH_MAX+1];
+        procOut->nfs = check4nfs(path, buff);
+    } else if (do_stat != DO_STAT) {
+        return;
+    }
+
+    if (!path) { return; }
+
+    struct stat st = { .st_dev = 0 };
+
+    if (stat(path, &st)) { fprintf(stderr, "Failed to stat [%s]\n", path); }
+
+    procOut->dev = st.st_dev;
+    procOut->ino = st.st_ino;
+}
+
+/**
+ * populate the proc structure.
+ *
+ * @param pid the process pid.
+ * @param do_stat if true then we should stat the process executable.
+ * @param path the path to the process exeutable if it exists, otherwise null.
+ * @param procOut the structure to populate.
+ * @return 0 if all if all goes well.
+ */
+static int getProcInfo(int pid, int do_stat, char* path, struct proc* procOut)
+{
+    psinfo_t psinfo;
+    {
+        int psinfoFd = openProcFile("%d/psinfo", pid);
+        if (psinfoFd < 0) {
+            return 1;
+        }
+        read(psinfoFd, &psinfo, sizeof(psinfo_t));
+        close(psinfoFd);
+    }
+
+    // argv0, argv1
+    procOut->argv0 = procOut->argv1 = NULL;
+    {
+        char* args = getArguments(&psinfo);
+        int argCount;
+        memcpy(&argCount, args, 4);
+        char* argv = args+4;
+        for (int i = 0; i < argCount; i++) {
+            if (i == 0) {
+                procOut->argv0 = strdup(argv);
+                assert(procOut->argv0);
+            } else if (argv[0] != '-') {
+                procOut->argv1 = strdup(argv);
+                assert(procOut->argv1);
+                break;
+            }
+            argv += strlen(argv) + 1;
+        }
+        free(args);
+    }
+
+    // argv0base, argv1base
+    procOut->argv0base = baseName(procOut->argv0);
+    procOut->argv1base = baseName(procOut->argv1);
+
+    // statname is compared to argv1base used to decide if it's executing a script.
+    procOut->statname = strdup(psinfo.pr_fname);
+
+    // Is it a kernel thread or zombie.
+    // Linux detects this by checking the upper and lower bounds of the address space.
+    // From some basic testing I see that Illumos sets the size of obvious kernel threads
+    // such as sched to 0 so we'll assume that kernel threads are defined by image size
+    // being zero.
+    procOut->kernel = (psinfo.pr_size == 0);
+
+    if (!procOut->kernel) {
+        /* nfs, ino, dev */
+        getNfsInodeNumberAndDevice(do_stat, path, procOut);
+    }
+
+    procOut->pid = psinfo.pr_pid;
+    procOut->sid = psinfo.pr_sid;
+
+    return 0;
+}
+
+static void freeProcList()
+{
+    PROC* p;
+	PROC* n = plist;
+	for (p = plist; n; p = n) {
+		n = p->next;
+		if (p->argv0) { free(p->argv0); }
+		if (p->argv1) { free(p->argv1); }
+		if (p->statname) { free(p->statname); }
+		free(p);
+	}
+	plist = NULL;
+}
+
+struct PidAndPath
+{
+    int pid;
+    char* path;
+};
+
+static int getPidByPath(struct PidAndPath** output)
+{
+    int pipeEnds[2];
+    if (pipe(pipeEnds)) {
+        nsyslog(LOG_ERR, "pipe() failed");
+        return -1;
+    }
+
+    int pid = fork();
+    if (pid < 0) {
+        nsyslog(LOG_ERR, "fork() failed");
+        return -1;
+    } else if (pid == 0) {
+        // Child
+
+        // setup stdout as the pipe write fd.
+        close(STDOUT_FILENO);
+        dup2(pipeEnds[1], STDOUT_FILENO);
+
+        char* argv[] = { "runningapps", NULL };
+        execvp("runningapps", argv);
+
+        // (hopefully) never reached
+        nsyslog(LOG_ERR, "failed to execute 'runningapps', [%s]", strerror(errno));
+        exit(72);
+    }
+
+    // Parent
+    close(pipeEnds[1]);
+
+    // parse the result from runningapps
+    struct PidAndPath* out = NULL;
+    int count = 0;
+
+    FILE* pipeStream = fdopen(pipeEnds[0], "rb");
+    if (!pipeStream) {
+        nsyslog(LOG_ERR, "failed to open pipe to child for reading");
+        return -1;
+    }
+
+    char* line = NULL;
+    size_t len;
+    while (getline(&line, &len, pipeStream) > 0) {
+        char* pathBeginning;
+        int pid = strtol(line, &pathBeginning, 10);
+        if (!pid) {
+            nsyslog(LOG_ERR, "runningapps returned a non-pid");
+        } else if (!pathBeginning || *pathBeginning != ' ') {
+            nsyslog(LOG_ERR, "runningapps did not return a space after the pid");
+        } else {
+            out = realloc(out, (++count) * sizeof(struct PidAndPath));
+            out[count-1].path = strdup(pathBeginning+1);
+            // get rid of the trailing \n
+            out[count-1].path[strlen(out[count-1].path) - 1] = '\0';
+            out[count-1].pid = pid;
+            //printf("Got line [%d] [%s]\n", pid, out[count-1].path);
+        }
+        free(line);
+        line = NULL;
+    }
+    *output = out;
+
+
+    int ret;
+    if (wait(&ret) == -1) {
+        nsyslog(LOG_ERR, "error waiting for runningapps to end");
+        return -1;
+    }
+
+    if (!WIFEXITED(ret)) {
+        nsyslog(LOG_ERR, "runningapps exited abnormally");
+        return -1;
+    }
+
+    return count;
+}
+
+static int readproc1(struct PidAndPath* pap, int papCount, int do_stat)
+{
+	/* Open the /proc directory. */
+	if (chdir("/proc") == -1) {
+		nsyslog(LOG_ERR, "chdir /proc failed");
+		return -1;
+	}
+    DIR* procDir;
+	if ((procDir = opendir(".")) == NULL) {
+		nsyslog(LOG_ERR, "cannot opendir(/proc)");
+		return -1;
+	}
+
+	/* Free the already existing process list. */
+    freeProcList();
+
+	/* Walk through the directory. */
+    struct dirent* d;
+	while ((d = readdir(procDir)) != NULL) {
+
+		/* See if this is a process */
+        int pid;
+		if ((pid = atoi(d->d_name)) == 0) { continue; }
+
+        struct proc processInfo = {0};
+
+        char* path = NULL;
+        for (int i = 0; i < papCount; i++) {
+            if (pid == pap[i].pid) {
+                path = pap[i].path;
+                break;
+            }
+        }
+
+        if (getProcInfo(pid, do_stat, path, &processInfo)) { continue; }
+
+		/* Get a PROC struct . */
+		PROC* p = xmalloc(sizeof(PROC));
+		memcpy(p, &processInfo, sizeof(PROC));
+
+		/* Link it into the list. */
+		p->next = plist;
+		plist = p;
+    }
+    closedir(procDir);
+
+	/* Done. */
+	return 0;
+}
+
+int readproc(int do_stat)
+{
+    // Get the paths for each process.
+    struct PidAndPath* pap;
+    int papCount = getPidByPath(&pap);
+    if (papCount < 0) { return -1; }
+
+    int ret = readproc1(pap, papCount, do_stat);
+
+    for (int i = 0; i < papCount; i++) {
+        free(pap[i].path);
+    }
+    free(pap);
+
+    return ret;
+}
+
+#else /* __sun__ */
 
 /*
  *	Read the proc filesystem.
@@ -630,6 +1016,7 @@ int readproc(int do_stat)
 	/* Done. */
 	return 0;
 }
+#endif /* not __sun__ */
 
 PIDQ_HEAD *init_pid_q(PIDQ_HEAD *q)
 {
